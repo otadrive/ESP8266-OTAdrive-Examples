@@ -1,12 +1,197 @@
-#include <Arduino.h>
-#include <ESP8266httpUpdate.h>
-#include <ArduinoJson.h>
-#include <EEPROM.h>
-#include <WiFiClientSecureBearSSL.h>
+// Example of the different modes of the X.509 validation options
+// in the WiFiClientBearSSL object
+//
+// Mar 2018 by Earle F. Philhower, III
+// Released to the public domain
 
-// OTAdrive.com CA certificate
-const char otadrv_ca[] =
-    "-----BEGIN CERTIFICATE-----\n\
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <StackThunk.h>
+#include <time.h>
+
+#ifndef STASSID
+#define STASSID "smarthomehub"
+#define STAPSK "smarthome2015"
+#endif
+
+const char *ssid = STASSID;
+const char *pass = STAPSK;
+
+const char *host = "api.github.com";
+const char *hostOta = "otadrive.com";
+const uint16_t port = 443;
+const char *path = "/";
+
+// Set time via NTP, as required for x.509 validation
+void setClock()
+{
+  configTime(3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+
+  Serial.print("Waiting for NTP time sync: ");
+  time_t now = time(nullptr);
+  while (now < 8 * 3600 * 2)
+  {
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+  }
+  Serial.println("");
+  struct tm timeinfo;
+  gmtime_r(&now, &timeinfo);
+  Serial.print("Current time: ");
+  Serial.print(asctime(&timeinfo));
+}
+
+// Try and connect using a WiFiClientBearSSL to specified host:port and dump HTTP response
+void fetchURL(BearSSL::WiFiClientSecure *client, const char *host, const uint16_t port, const char *path)
+{
+  if (!path)
+  {
+    path = "/";
+  }
+
+  ESP.resetFreeContStack();
+  uint32_t freeStackStart = ESP.getFreeContStack();
+  Serial.printf("Trying: %s:443...", host);
+  client->connect(host, port);
+  if (!client->connected())
+  {
+    Serial.printf("*** Can't connect. ***\n-------\n");
+    return;
+  }
+  Serial.printf("Connected!\n-------\n");
+  client->write("GET ");
+  client->write(path);
+  client->write(" HTTP/1.0\r\nHost: ");
+  client->write(host);
+  client->write("\r\nUser-Agent: ESP8266\r\n");
+  client->write("\r\n");
+  uint32_t to = millis() + 5000;
+  if (client->connected())
+  {
+    do
+    {
+      char tmp[32];
+      memset(tmp, 0, 32);
+      int rlen = client->read((uint8_t *)tmp, sizeof(tmp) - 1);
+      yield();
+      if (rlen < 0)
+      {
+        break;
+      }
+      // Only print out first line up to \r, then abort connection
+      char *nl = strchr(tmp, '\r');
+      if (nl)
+      {
+        *nl = 0;
+        Serial.print(tmp);
+        break;
+      }
+      Serial.print(tmp);
+    } while (millis() < to);
+  }
+  client->stop();
+  uint32_t freeStackEnd = ESP.getFreeContStack();
+  Serial.printf("\nCONT stack used: %d\n", freeStackStart - freeStackEnd);
+  Serial.printf("BSSL stack used: %d\n-------\n\n", stack_thunk_get_max_usage());
+}
+
+void fetchNoConfig()
+{
+  Serial.printf(R"EOF(
+If there are no CAs or insecure options specified, BearSSL will not connect.
+Expect the following call to fail as none have been configured.
+)EOF");
+  BearSSL::WiFiClientSecure client;
+  fetchURL(&client, host, port, path);
+}
+
+void fetchInsecure()
+{
+  Serial.printf(R"EOF(
+This is absolutely *insecure*, but you can tell BearSSL not to check the
+certificate of the server.  In this mode it will accept ANY certificate,
+which is subject to man-in-the-middle (MITM) attacks.
+)EOF");
+  BearSSL::WiFiClientSecure client;
+  client.setInsecure();
+  fetchURL(&client, host, port, path);
+}
+
+void fetchFingerprint()
+{
+  Serial.printf(R"EOF(
+The SHA-1 fingerprint of an X.509 certificate can be used to validate it
+instead of the while certificate.  This is not nearly as secure as real
+X.509 validation, but is better than nothing.  Also be aware that these
+fingerprints will change if anything changes in the certificate chain
+(i.e. re-generating the certificate for a new end date, any updates to
+the root authorities, etc.).
+)EOF");
+  BearSSL::WiFiClientSecure client;
+  static const char fp[] PROGMEM = "59:74:61:88:13:CA:12:34:15:4D:11:0A:C1:7F:E6:67:07:69:42:F5";
+  client.setFingerprint(fp);
+  fetchURL(&client, host, port, path);
+}
+
+void fetchSelfSigned()
+{
+  Serial.printf(R"EOF(
+It is also possible to accept *any* self-signed certificate.  This is
+absolutely insecure as anyone can make a self-signed certificate.
+)EOF");
+  BearSSL::WiFiClientSecure client;
+  Serial.printf("First, try and connect to a badssl.com self-signed website (will fail):\n");
+  fetchURL(&client, "self-signed.badssl.com", 443, "/");
+  Serial.printf("Now we'll enable self-signed certs (will pass)\n");
+  client.allowSelfSignedCerts();
+  fetchURL(&client, "self-signed.badssl.com", 443, "/");
+}
+
+void fetchKnownKey()
+{
+  Serial.printf(R"EOF(
+The server certificate can be completely ignored and its public key
+hardcoded in your application. This should be secure as the public key
+needs to be paired with the private key of the site, which is obviously
+private and not shared.  A MITM without the private key would not be
+able to establish communications.
+)EOF");
+  // Extracted by: openssl x509 -pubkey -noout -in servercert.pem
+  static const char pubkey[] PROGMEM = R"KEY(
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoObTh6xvTjspdWBMSh76
+3a+BCjfEia21jp0dDFXapLHLq9MUvNJtuNF8Nh9FoQYlMmN/lEz01pcGPyTyhfWD
+jCeKf2rIRugEb0xfTEiapoDBCNucboGLVFnwxm1YKj1C6tpdqmuQe68SNDAbIlyv
+ze7yPAiQmZG+QRbG4JVZqdZSOd7powLiaOP5tVbOrmInXv+jlB+Jgg9d6oJNr94P
+O6oESm+khUOAETXxO9ZmgGiXbgrpeVdjRJHB4kXb3Sy5LT0Wdq8LpASAwBA1JvKf
+OEOoHaUZefCwYJhA+ExUU18yDt6GZedPXCF6xzV/3qPgjrLTAkJkQBQhIJYUCVQf
+UwIDAQAB
+-----END PUBLIC KEY-----
+)KEY";
+  BearSSL::WiFiClientSecure client;
+  BearSSL::PublicKey key(pubkey);
+
+  client.setKnownKey(&key);
+  fetchURL(&client, host, port, path);
+}
+
+void fetchOta()
+{
+  static const char otadrv_pubkey[] =
+      "-----BEGIN PUBLIC KEY-----\n\
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA9Tyj8VVrM7XLKVuI+UA4\n\
+mIy5JzQuIlLm6ZRXp8wjxpjxRpsYmYJPaHrqDqqhhQIjqK5IY7ssdYh3S93UuFZG\n\
+opQd/xfSqvw9ZTBT7QYePsPswKHhgQH3NONzkf6Ify012XX4FL0wQ8UsjytKSDdd\n\
+M04rOOg11RUzPiemXbgZRINL3wSPpJ3Ryq+OVzF4LNulh2jctw6Dy25eXBfSyTxD\n\
+TroPeY9Dzxv7FzOxsiGUEGex9bgf2edhEBbeltprjFGQ6ueipLg7LnnbMjN77wjE\n\
+FA4qzvNwp0yV1c+Cv0mQHhnqqWAl3jfmMAA63nHGYJRW4HIiTXOtUnC768eBG7B9\n\
+lQIDAQAB\n\
+-----END PUBLIC KEY-----";
+
+  static const char otadrv_ca[] PROGMEM =
+      "-----BEGIN CERTIFICATE-----\n\
 MIIEzjCCA7agAwIBAgIQJt3SK0bJxE1aaU05gH5yrTANBgkqhkiG9w0BAQsFADB+\n\
 MQswCQYDVQQGEwJQTDEiMCAGA1UEChMZVW5pemV0byBUZWNobm9sb2dpZXMgUy5B\n\
 LjEnMCUGA1UECxMeQ2VydHVtIENlcnRpZmljYXRpb24gQXV0aG9yaXR5MSIwIAYD\n\
@@ -35,165 +220,141 @@ y+WutpPhI5+bP0b37o6hAFtmwx5oI4YPXXe6U635UvtwFcV16895rUl88nZirkQv\n\
 xV9RNCVBahIKX46uEMRDiTX97P8x5uweh+k6fClQRUGjFA==\n\
 -----END CERTIFICATE-----";
 
-// configuration variables
-int onDelay;
-int offDelay;
+  HTTPClient http;
+  BearSSL::WiFiClientSecure client;
+  //BearSSL::X509List cert(otadrv_ca);
+  //client.setTrustAnchors(&cert);
+  BearSSL::PublicKey pkey(otadrv_pubkey);
+  client.setKnownKey(&pkey);
+  //setClock();
 
-// To inject firmware info into binary file, You have to use following macro according to let
-// OTAdrive to detect binary info automatically
-#define ProductKey "1c70ece5-07b2-4ee3-9ee3-9b9f566dfb2e" // Replace with your own APIkey
-#define Version "1.0.0.7"
-#define MakeFirmwareInfo(k, v) "&_FirmwareInfo&k=" k "&v=" v "&FirmwareInfo_&"
+  if (http.begin(client, "https://otadrive.com/deviceapi/config?k=1c70ece5-07b2-4ee3-9ee3-9b9f566dfb2e&s=11135564"))
+  {
+    Serial.println("begin http;");
+    Serial.printf("http GET %d\n", http.GET());
+    Serial.printf("http %s\n", http.getString().c_str());
+  }
+}
 
-int *eeIntPtr;
+void fetchCertAuthority()
+{
+  static const char digicert[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDxTCCAq2gAwIBAgIQAqxcJmoLQJuPC3nyrkYldzANBgkqhkiG9w0BAQUFADBs
+MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
+d3cuZGlnaWNlcnQuY29tMSswKQYDVQQDEyJEaWdpQ2VydCBIaWdoIEFzc3VyYW5j
+ZSBFViBSb290IENBMB4XDTA2MTExMDAwMDAwMFoXDTMxMTExMDAwMDAwMFowbDEL
+MAkGA1UEBhMCVVMxFTATBgNVBAoTDERpZ2lDZXJ0IEluYzEZMBcGA1UECxMQd3d3
+LmRpZ2ljZXJ0LmNvbTErMCkGA1UEAxMiRGlnaUNlcnQgSGlnaCBBc3N1cmFuY2Ug
+RVYgUm9vdCBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMbM5XPm
++9S75S0tMqbf5YE/yc0lSbZxKsPVlDRnogocsF9ppkCxxLeyj9CYpKlBWTrT3JTW
+PNt0OKRKzE0lgvdKpVMSOO7zSW1xkX5jtqumX8OkhPhPYlG++MXs2ziS4wblCJEM
+xChBVfvLWokVfnHoNb9Ncgk9vjo4UFt3MRuNs8ckRZqnrG0AFFoEt7oT61EKmEFB
+Ik5lYYeBQVCmeVyJ3hlKV9Uu5l0cUyx+mM0aBhakaHPQNAQTXKFx01p8VdteZOE3
+hzBWBOURtCmAEvF5OYiiAhF8J2a3iLd48soKqDirCmTCv2ZdlYTBoSUeh10aUAsg
+EsxBu24LUTi4S8sCAwEAAaNjMGEwDgYDVR0PAQH/BAQDAgGGMA8GA1UdEwEB/wQF
+MAMBAf8wHQYDVR0OBBYEFLE+w2kD+L9HAdSYJhoIAu9jZCvDMB8GA1UdIwQYMBaA
+FLE+w2kD+L9HAdSYJhoIAu9jZCvDMA0GCSqGSIb3DQEBBQUAA4IBAQAcGgaX3Nec
+nzyIZgYIVyHbIUf4KmeqvxgydkAQV8GK83rZEWWONfqe/EW1ntlMMUu4kehDLI6z
+eM7b41N5cdblIZQB2lWHmiRk9opmzN6cN82oNLFpmyPInngiK3BD41VHMWEZ71jF
+hS9OMPagMRYjyOfiZRYzy78aG6A9+MpeizGLYAiJLQwGXFK3xPkKmNEVX58Svnw2
+Yzi9RKR/5CYrCsSXaQ3pjOLAEFe4yHYSkVXySGnYvCoCWw9E1CAx2/S6cCZdkGCe
+vEsXCS+0yx5DaMkHJ8HSXPfqIbloEpw8nL+e/IBcm2PN7EeqJSdnoDfzAIJ9VNep
++OkuE6N36B9K
+-----END CERTIFICATE-----
+)EOF";
 
-void update();
-void updateConfigs();
-void saveConfigs();
-void loadConfigs();
+  Serial.printf(R"EOF(
+A specific certification authority can be passed in and used to validate
+a chain of certificates from a given server.  These will be validated
+using BearSSL's rules, which do NOT include certificate revocation lists.
+A specific server's certificate, or your own self-signed root certificate
+can also be used.  ESP8266 time needs to be valid for checks to pass as
+BearSSL does verify the notValidBefore/After fields.
+)EOF");
+
+  BearSSL::WiFiClientSecure client;
+  BearSSL::X509List cert(digicert);
+
+  client.setTrustAnchors(&cert);
+  HTTPClient http;
+
+  Serial.printf("Try validating without setting the time (should fail)\n");
+  fetchURL(&client, host, port, path);
+
+  Serial.printf("Try again after setting NTP time (should pass)\n");
+  setClock();
+
+  if (http.begin(client, "https://otadrive.com/deviceapi/config?k=1c70ece5-07b2-4ee3-9ee3-9b9f566dfb2e&s=11135564"))
+  {
+    Serial.println("begin http;");
+    Serial.printf("http GET %d", http.GET());
+  }
+
+  fetchURL(&client, hostOta, 443, "/deviceapi/config?k=1c70ece5-07b2-4ee3-9ee3-9b9f566dfb2e&s=11135564");
+}
+
+void fetchFaster()
+{
+  Serial.printf(R"EOF(
+The ciphers used to set up the SSL connection can be configured to
+only support faster but less secure ciphers.  If you care about security
+you won't want to do this.  If you need to maximize battery life, these
+may make sense
+)EOF");
+  BearSSL::WiFiClientSecure client;
+  client.setInsecure();
+  uint32_t now = millis();
+  fetchURL(&client, host, port, path);
+  uint32_t delta = millis() - now;
+  client.setInsecure();
+  client.setCiphersLessSecure();
+  now = millis();
+  fetchURL(&client, host, port, path);
+  uint32_t delta2 = millis() - now;
+  std::vector<uint16_t> myCustomList = {BR_TLS_RSA_WITH_AES_256_CBC_SHA256, BR_TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, BR_TLS_RSA_WITH_3DES_EDE_CBC_SHA};
+  client.setInsecure();
+  client.setCiphers(myCustomList);
+  now = millis();
+  fetchURL(&client, host, port, path);
+  uint32_t delta3 = millis() - now;
+  Serial.printf("Using more secure: %dms\nUsing less secure ciphers: %dms\nUsing custom cipher list: %dms\n", delta, delta2, delta3);
+}
 
 void setup()
 {
-  // put your setup code here, to run once:
-  pinMode(2, OUTPUT);
-  WiFi.begin("smarthomehub", "smarthome2015");
-
-  EEPROM.begin(32);
-  eeIntPtr = (int *)EEPROM.getDataPtr();
-  loadConfigs();
-
   Serial.begin(115200);
-}
+  Serial.println();
+  Serial.println();
 
-uint32_t updateCounter = 0;
+  // We start by connecting to a WiFi network
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  //fetchNoConfig();
+  //fetchInsecure();
+  //fetchFingerprint();
+  //fetchSelfSigned();
+  //fetchKnownKey();
+  //fetchCertAuthority();
+  //fetchFaster();
+  fetchOta();
+}
 
 void loop()
 {
-  // put your main code here, to run repeatedly:
-  digitalWrite(2, 1);
-  delay(onDelay);
-  digitalWrite(2, 0);
-  delay(offDelay);
-  Serial.printf("blink: %d\n", updateCounter);
-
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    updateCounter++;
-    if (updateCounter > 20)
-    {
-      updateCounter = 0;
-      update();
-      updateConfigs();
-    }
-  }
-}
-
-void saveConfigs()
-{
-  Serial.printf("save configs, on:%d, off:%d\n", onDelay, offDelay);
-  eeIntPtr[1] = onDelay;
-  eeIntPtr[2] = offDelay;
-  EEPROM.commit();
-}
-
-void loadConfigs()
-{
-  // check configs initialized in eeprom or not
-  if (eeIntPtr[0] != 0x4A)
-  {
-    // configs not initialized yet. write for first time
-    eeIntPtr[0] = 0x4A; // memory sign
-    eeIntPtr[1] = 200;  // onDelay
-    eeIntPtr[2] = 250;  // offDelay
-    EEPROM.commit();
-  }
-  else
-  {
-    // configs initialized and valid. read values
-    onDelay = eeIntPtr[1];
-    offDelay = eeIntPtr[2];
-  }
-
-  Serial.printf("load configs, on:%d, off:%d\n", onDelay, offDelay);
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-void updateConfigs()
-{
-  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  HTTPClient http;
-  String url = "https://www.otadrive.com/deviceapi/getconfig?";
-  url += MakeFirmwareInfo(ProductKey, Version);
-  url += "&s=" + String(ESP.getChipId());
-
-  http.setTimeout(1000);
-  http.setTimeout(1000);
-  client->setTimeout(1);
-  BearSSL::X509List cert(otadrv_ca);
-  client->setTrustAnchors(&cert);
-
-  Serial.println(url);
-
-  if (http.begin(*client, url))
-  {
-    int httpCode = http.GET();
-    Serial.printf("http code: %d\n", httpCode);
-
-    // httpCode will be negative on error
-    if (httpCode == HTTP_CODE_OK)
-    {
-      String payload = http.getString();
-      DynamicJsonDocument doc(512);
-      deserializeJson(doc, payload);
-
-      Serial.printf("http content: %s\n", payload.c_str());
-
-      if (doc.containsKey("onDelay") &&
-          doc.containsKey("offDelay"))
-      {
-        onDelay = doc["onDelay"].as<int>();
-        offDelay = doc["offDelay"].as<int>();
-        saveConfigs();
-      }
-    }
-  }
-}
-
-void update()
-{
-  String url = "http://otadrive.com/deviceapi/update?";
-  url += MakeFirmwareInfo(ProductKey, Version);
-  url += "&s=" + String(ESP.getChipId());
-
-  WiFiClient client;
-  ESPhttpUpdate.update(client, url, Version);
+  // Nothing to do here
 }
